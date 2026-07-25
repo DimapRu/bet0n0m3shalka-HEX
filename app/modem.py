@@ -182,7 +182,7 @@ class Channel:
     _q = None          # {'to_rx': ndarray, 'to_tx': ndarray}
     _lock = None
 
-    def __init__(self, loopback=False, loop_snr=20.0, role=None):
+    def __init__(self, loopback=False, loop_snr=20.0, role=None, mic=None):
         self.loopback = loopback
         self.loop_snr = loop_snr
         self.role = role            # 'tx' или 'rx' (None = одиночный)
@@ -195,6 +195,33 @@ class Channel:
         else:
             import sounddevice as sd  # noqa
             self.sd = sd
+            # Вход: явный --mic N, иначе авто-выбор реального микрофона.
+            # MME часто идёт через шумодав/эхоподавление Realtek, которое
+            # вырезает тоны модема -> предпочитаем WASAPI / DirectSound.
+            self.mic = mic if mic is not None else self._auto_mic()
+            if self.mic is not None:
+                d = sd.query_devices(self.mic)
+                api = sd.query_hostapis(d['hostapi'])['name']
+                print(f"[audio] микрофон #{self.mic}: {d['name']} ({api})")
+
+    @staticmethod
+    def _auto_mic():
+        """Индекс лучшего реального входного устройства или None (default)."""
+        import sounddevice as sd
+        bad = ('steam', 'mapper', 'primary', 'звуковой микшер', 'wave')
+        prio = {'Windows WASAPI': 0, 'Windows DirectSound': 1, 'MME': 2}
+        best, best_p = None, 99
+        for i, d in enumerate(sd.query_devices()):
+            if d['max_input_channels'] <= 0:
+                continue
+            name = d['name'].lower()
+            if any(b in name for b in bad):
+                continue
+            api = sd.query_hostapis(d['hostapi'])['name']
+            p = prio.get(api, 3)
+            if p < best_p:
+                best, best_p = i, p
+        return best
 
     def _dst(self):
         # куда пишем: tx -> to_rx, rx -> to_tx, одиночный -> to_rx
@@ -227,9 +254,22 @@ class Channel:
                 out = Channel._q[src].copy()
                 Channel._q[src] = np.zeros(0, np.float32)
             return out
-        rec = self.sd.rec(int(seconds * FS), samplerate=FS, channels=1,
-                          dtype='float32')
+        fs = FS
+        if self.mic is not None:
+            try:
+                self.sd.check_input_settings(device=self.mic, samplerate=FS)
+            except Exception:
+                # родная частота устройства (WASAPI без ремикса)
+                fs = int(self.sd.query_devices(self.mic)['default_samplerate'])
+        rec = self.sd.rec(int(seconds * fs), samplerate=fs, channels=1,
+                          dtype='float32', device=self.mic)
         self.sd.wait()
+        if fs != FS:  # приводим к системной частоте модема
+            from scipy.signal import resample_poly
+            from math import gcd
+            g = gcd(fs, FS)
+            rec = resample_poly(rec[:, 0], FS // g, fs // g).astype(np.float32)
+            return rec
         return rec[:, 0]
 
     def measure_noise(self, seconds: float = 2.0) -> float:
@@ -521,6 +561,24 @@ def cmd_blast(chan: Channel, path: str, pair: int):
     print(f"\n[BLAST-TX] передал всё за {dt:.1f} с (~{len(data)*8/dt:.0f} бит/с)")
 
 
+def cmd_mictest(chan: Channel):
+    """Живой RMS-метр микрофона: проверка, что звук вообще доходит."""
+    if chan.loopback:
+        print("[мик] в loopback-режиме микрофон не используется")
+        return
+    print("[мик] 6 секунд пишу уровень. Хлопай/говори/включи тон модема.")
+    print("[мик] тишина обычно RMS<0.003; речь/хлопок RMS>0.01; модем RMS>0.05")
+    print("      время   RMS     пик    уровень")
+    for i in range(30):
+        rec = chan.record(0.2)
+        rms = float(np.sqrt(np.mean(rec ** 2))) if len(rec) else 0.0
+        peak = float(np.max(np.abs(rec))) if len(rec) else 0.0
+        bars = '#' * min(50, int(rms * 800))
+        print(f"      {i*0.2:4.1f}s  {rms:.4f}  {peak:.4f}  {bars}")
+    print("[мик] если все строки ~0.000x даже при громком звуке -> "
+          "микрофон задавлен в Windows (уровень/шумодав/доступ)")
+
+
 def cmd_listen(chan: Channel, pair: int):
     os.makedirs(RECV_DIR, exist_ok=True)
     print("[BLAST-RX] слушаю одностороннюю передачу (FSK)... Ctrl+C — отмена")
@@ -574,9 +632,11 @@ def main():
     ap.add_argument('--loop-snr', type=float, default=20.0, help='SNR loopback-канала, дБ')
     ap.add_argument('--send', metavar='FILE', help='сразу передать файл')
     ap.add_argument('--recv', action='store_true', help='сразу принять')
+    ap.add_argument('--mic', type=int, default=None,
+                    help='индекс микрофона (python -m sounddevice); по умолчанию авто')
     args = ap.parse_args()
 
-    chan = Channel(loopback=args.loopback, loop_snr=args.loop_snr)
+    chan = Channel(loopback=args.loopback, loop_snr=args.loop_snr, mic=args.mic)
     if args.loopback:
         print(f"[loopback] цифровой канал, SNR={args.loop_snr} дБ")
 
@@ -595,6 +655,7 @@ def main():
         print("6) Проверка связи (есть ли приёмник рядом)")
         print("7) Передать файл БЕЗ подтверждений (односторонний, FSK)")
         print("8) Принять одностороннюю передачу (п.7)")
+        print("9) Тест микрофона (уровень сигнала)")
         print("0) Выход")
         c = input("> ").strip()
         if c == '1':
@@ -626,6 +687,7 @@ def main():
             p = pick_file_to_send()
             if p: cmd_blast(chan, p, args.pair)
         elif c == '8': cmd_listen(chan, args.pair)
+        elif c == '9': cmd_mictest(chan)
         elif c == '0': break
 
 
