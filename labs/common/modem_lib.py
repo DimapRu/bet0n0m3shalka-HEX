@@ -255,7 +255,9 @@ def cross_correlate(signal_rx: NDArray, template: NDArray) -> tuple[NDArray, int
     if norm > 0:
         # нормируем на локальную энергию сигнала
         win = np.ones(len(template))
-        local_energy = np.sqrt(sp_signal.fftconvolve(signal_rx**2, win, mode="valid"))
+        # clip: из-за ошибок округления FFT значения бывают чуть < 0 -> NaN в sqrt
+        local_energy = np.sqrt(np.clip(
+            sp_signal.fftconvolve(signal_rx**2, win, mode="valid"), 0.0, None))
         corr = corr / (local_energy * norm + 1e-12)
     peak_idx = int(np.argmax(np.abs(corr)))
     return corr, peak_idx, float(corr[peak_idx])

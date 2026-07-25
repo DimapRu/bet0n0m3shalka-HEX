@@ -596,9 +596,14 @@ def cmd_listen(chan: Channel, pair: int):
     try:
         while True:
             audio = chan.record(3.0)
+            rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
+            bars = '#' * min(40, int(rms * 400))
             dec = rx_frame_bits(audio, 'FSK', pair)
             fr = decode_frame(dec) if dec else None
             if not fr:
+                print(f"\r[BLAST-RX] слушаю... {time.time()-t0:5.1f}с  "
+                      f"RMS {rms:.4f} {bars:<40} (нет сигнала — проверь микрофон, п.9)",
+                      end='', flush=True)
                 continue
             if fr[0] == T_HANDSHAKE and name is None:
                 name, size, md5, n = fr[2].rstrip(b'\x00').decode().split('|')
