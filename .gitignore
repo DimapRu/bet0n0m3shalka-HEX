@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+labs/results/*.wav
+labs/results/*.raw
+*.log
