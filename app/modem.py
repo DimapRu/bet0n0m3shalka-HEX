@@ -280,6 +280,12 @@ class Channel:
 # ---------------------------------------------------------------------------
 # ПЕРЕДАЧА файла
 # ---------------------------------------------------------------------------
+def _preview(payload: bytes, width: int = 32) -> str:
+    """Человекочитаемое превью кадра: печатные символы как есть, прочее — '·'."""
+    txt = ''.join(chr(b) if 32 <= b < 127 else '·' for b in payload[:width])
+    return f"'{txt}'"
+
+
 def cmd_send(chan: Channel, path: str, pair: int):
     with open(path, 'rb') as f:
         data = f.read()
@@ -288,6 +294,7 @@ def cmd_send(chan: Channel, path: str, pair: int):
     frames = [data[i:i + PAYLOAD_BYTES] for i in range(0, len(data), PAYLOAD_BYTES)]
     n = len(frames)
     print(f"[TX] файл '{name}': {len(data)} Б, MD5 {md5[:8]}..., кадров {n}")
+    print(f"[TX] содержимое: {_preview(data[:60])}")
 
     # 1) HANDSHAKE (всегда FSK — надёжно): имя|размер|md5|n.
     #    Проверка связи: шлём до HS_TRIES раз, ждём ответ приёмника.
@@ -317,6 +324,7 @@ def cmd_send(chan: Channel, path: str, pair: int):
     t0 = time.time(); retx_total = 0
     for i, chunk in enumerate(frames):
         seq = i % 256
+        print(f"\n[TX] кадр {i:3d}: {_preview(chunk)}")
         sent = False
         # цикл деградации: не получили ACK за MAX_RETX — понижаем режим,
         # вплоть до FSK (RX поймёт переключение по FSK-декоду кадра)
@@ -420,6 +428,7 @@ def cmd_recv(chan: Channel, pair: int):
             chunk_len = min(PAYLOAD_BYTES, size - len(buf))
             buf.extend(payload[:max(0, chunk_len)])
             expected_seq += 1
+            print(f"\n[RX] кадр {expected_seq-1:3d}: {_preview(payload)}")
             reply_type, reply_pl = T_ACK, b''
             # live-адаптация: каждые PROBE_EVERY кадров переоцениваем
             if expected_seq % PROBE_EVERY == 0:
@@ -554,8 +563,7 @@ def cmd_blast(chan: Channel, path: str, pair: int):
         bits = encode_frame(T_DATA, i % 256, chunk)
         chan.play(tx_frame_audio(bits, 'FSK', pair))
         time.sleep(BCAST_GAP_S)
-        if (i + 1) % 10 == 0 or i + 1 == n:
-            print(f"\r[BLAST-TX] {i+1}/{n}", end='', flush=True)
+        print(f"\n[BLAST-TX] кадр {i:3d}/{n}: {_preview(chunk)}")
     chan.play(tx_frame_audio(encode_frame(T_EOF, 0, b''), 'FSK', pair))
     dt = time.time() - t0
     print(f"\n[BLAST-TX] передал всё за {dt:.1f} с (~{len(data)*8/dt:.0f} бит/с)")
@@ -603,7 +611,7 @@ def cmd_listen(chan: Channel, pair: int):
                     take = min(PAYLOAD_BYTES, size - len(buf))
                     buf.extend(payload[:max(0, take)])
                     expected += 1; got += 1
-                    print(f"\r[BLAST-RX] {got}/{n} кадров", end='', flush=True)
+                    print(f"\n[BLAST-RX] кадр {got:3d}/{n}: {_preview(payload)}")
                 continue
             if fr[0] == T_EOF:
                 break
