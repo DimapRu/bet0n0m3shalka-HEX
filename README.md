@@ -1,1 +1,0 @@
-# bet0n0m3shalka-HEX
