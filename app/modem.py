@@ -109,27 +109,79 @@ def tx_frame_audio(bits: str, mode: str, pair: int) -> np.ndarray:
     return np.concatenate([pre, body])  # без паузы: оффсет считается точно
 
 
+def _fsk_try_decode(sig: np.ndarray, mark: float, space: float):
+    """Один проход: chirp -> FSK-демод -> packet_decode. dict или None."""
+    chirp = m.generate_chirp(300, 3000, 0.05, fs=FS)
+    if len(sig) <= len(chirp) + 500:
+        return None
+    corr, idx, val = m.cross_correlate(sig, chirp)
+    # порог 0.15: акустический канал (реверберация/телефон) сильно
+    # занижает нормированный пик; ложные срабатывания отсечёт preamble+CRC
+    if abs(val) < 0.15:
+        return None
+    start = idx + len(chirp) + int(0.01 * FS)
+    bits, _ = m.fsk_demodulate(sig[start:], mark, space, 100, FS)
+    dec = m.packet_decode(bits)
+    return dec if dec.get('found') else None
+
+
+def _resample_by(sig: np.ndarray, factor: float) -> np.ndarray:
+    """Лёгкий ресемплинг для компенсации clock skew (рассинхрон АЦП/ЦАП)."""
+    from scipy.signal import resample_poly
+    from math import gcd
+    if abs(factor - 1.0) < 0.0002:
+        return sig
+    up, down = 4000, int(round(4000 * factor))
+    g = gcd(up, down)
+    return resample_poly(sig, up // g, down // g).astype(np.float32)
+
+
 def rx_frame_bits(audio: np.ndarray, mode: str, pair: int):
-    """Возвращает dict packet_decode или None, если синхронизация не найдена."""
+    """Возвращает dict packet_decode или None, если синхронизация не найдена.
+
+    Телефон<->ноутбук имеют разные опорные частоты АЦП/ЦАП (типично 0.5-3%),
+    что ломает Гёрцеля. Поэтому: сначала быстрый путь без ресемплинга,
+    при неудаче — сетка skew 0.96..1.04 (грубо), затем тонкая доводка.
+    Арбитр — CRC32 кадра: первый кандидат с crc_ok побеждает.
+    """
     if mode == 'FSK':
         mark, space = PAIR_FSK.get(pair, PAIR_FSK[1])
-        chirp = m.generate_chirp(300, 3000, 0.05, fs=FS)
-        if len(audio) <= len(chirp):
-            return None
-        corr, idx, val = m.cross_correlate(audio, chirp)
-        # порог 0.15: акустический канал (реверберация/телефон) сильно
-        # занижает нормированный пик; ложные срабатывания отсечёт preamble+CRC
-        if abs(val) >= 0.15:
-            start = idx + len(chirp) + int(0.01 * FS)
-            seg = audio[start:]
-            bits, _ = m.fsk_demodulate(seg, mark, space, 100, FS)
-            dec = m.packet_decode(bits)
-            if dec.get('found'):
-                return dec
-        # fallback: chirp не нашёлся — пробуем преамбулу с начала окна
+        audio = np.asarray(audio, dtype=np.float32)
+        # быстрый путь: идеальные часы (loopback, один ноутбук)
+        best = _fsk_try_decode(audio, mark, space)
+        if best and best.get('crc_ok'):
+            return best
+        # fallback: chirp не нашёлся/обрезан — преамбула с начала окна
         bits, _ = m.fsk_demodulate(audio, mark, space, 100, FS)
-        dec = m.packet_decode(bits)
-        return dec if dec.get('found') else None
+        dec0 = m.packet_decode(bits)
+        if dec0.get('crc_ok'):
+            return dec0
+        if best is None and dec0.get('found'):
+            best = dec0
+        # медленный путь: сетка clock skew (телефон<->ноутбук расходятся
+        # по опорной частоте АЦП/ЦАП на 0.5-3%, что ломает Гёрцеля).
+        # Арбитр — CRC32: побеждает первый кандидат с crc_ok.
+        chirp = m.generate_chirp(300, 3000, 0.05, fs=FS)
+        cands = []
+        for skew in np.arange(0.96, 1.0401, 0.004):
+            rs = _resample_by(audio, float(skew))
+            if len(rs) <= len(chirp) + 500:
+                continue
+            _, _, val = m.cross_correlate(rs, chirp)
+            if abs(val) >= 0.15:
+                cands.append((abs(val), float(skew)))
+        cands.sort(reverse=True)
+        tried = set()
+        for _, coarse in cands[:4]:
+            for fine in np.arange(coarse - 0.004, coarse + 0.0041, 0.0005):
+                fine = round(float(fine), 4)
+                if fine in tried:
+                    continue
+                tried.add(fine)
+                dec = _fsk_try_decode(_resample_by(audio, fine), mark, space)
+                if dec and dec.get('crc_ok'):
+                    return dec
+        return best  # found без crc_ok (обрезанный кадр) или None
     cfg = _ofdm_cfg(mode)
     pre = m.ofdm_sync_preamble(cfg)
     if len(audio) <= len(pre):
