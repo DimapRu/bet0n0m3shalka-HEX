@@ -16,7 +16,33 @@
   - авто-адаптация: таблица Лабы 7 + live-пробник шума
   - целостность: CRC32 на кадр + MD5 всего файла
 """
-import os, sys, time, hashlib, argparse
+import os, sys, time, hashlib, argparse, subprocess
+
+
+def _try_import(mod: str) -> bool:
+    try:
+        __import__(mod)
+        return True
+    except ImportError:
+        return False
+
+
+def _ensure_deps():
+    """При первом запуске докачивает зависимости через pip."""
+    need = {'numpy': 'numpy', 'scipy': 'scipy',
+            'sounddevice': 'sounddevice', 'reedsolo': 'reedsolo'}
+    missing = [pip for mod, pip in need.items() if not _try_import(mod)]
+    if not missing:
+        return
+    print(f"[setup] докачиваю зависимости: {', '.join(missing)} ...")
+    try:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', *missing])
+    except Exception as e:
+        sys.exit(f"[setup] не удалось установить {missing}: {e}\n"
+                 f"Поставьте вручную: pip install -r requirements.txt")
+
+
+_ensure_deps()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'labs', 'common'))
 import numpy as np

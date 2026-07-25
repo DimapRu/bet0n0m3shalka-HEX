@@ -4,3 +4,11 @@ __pycache__/
 labs/results/*.wav
 labs/results/*.raw
 *.log
+
+# внешний инструмент со своим репо (не относится к хакатону)
+audio-dsp-mcp/
+
+# временные/отладочные файлы
+app/_*
+app/received/
+app/_loop_test.txt
