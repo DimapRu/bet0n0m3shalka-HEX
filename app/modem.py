@@ -117,12 +117,19 @@ def rx_frame_bits(audio: np.ndarray, mode: str, pair: int):
         if len(audio) <= len(chirp):
             return None
         corr, idx, val = m.cross_correlate(audio, chirp)
-        if abs(val) < 0.3:
-            return None
-        start = idx + len(chirp) + int(0.01 * FS)
-        seg = audio[start:]
-        bits, conf = m.fsk_demodulate(seg, mark, space, 100, FS)
-        return m.packet_decode(bits)
+        # порог 0.15: акустический канал (реверберация/телефон) сильно
+        # занижает нормированный пик; ложные срабатывания отсечёт preamble+CRC
+        if abs(val) >= 0.15:
+            start = idx + len(chirp) + int(0.01 * FS)
+            seg = audio[start:]
+            bits, _ = m.fsk_demodulate(seg, mark, space, 100, FS)
+            dec = m.packet_decode(bits)
+            if dec.get('found'):
+                return dec
+        # fallback: chirp не нашёлся — пробуем преамбулу с начала окна
+        bits, _ = m.fsk_demodulate(audio, mark, space, 100, FS)
+        dec = m.packet_decode(bits)
+        return dec if dec.get('found') else None
     cfg = _ofdm_cfg(mode)
     pre = m.ofdm_sync_preamble(cfg)
     if len(audio) <= len(pre):
@@ -592,23 +599,45 @@ def cmd_listen(chan: Channel, pair: int):
     print("[BLAST-RX] слушаю одностороннюю передачу (FSK)... Ctrl+C — отмена")
     name, size, md5, n = None, 0, '', 0
     buf, expected, got = bytearray(), 0, 0
+    mark, space = PAIR_FSK.get(pair, PAIR_FSK[1])
     t0 = time.time()
+    last_sig = t0                      # последний момент, когда был тон/кадр
+    tail = np.zeros(0, dtype=np.float32)  # хвост прошлого окна (overlap)
+    TAIL_S = 2.0                       # кадр ~3.5с, хвост 2с ловит его на границе
+    SILENCE_TIMEOUT = 5.0              # авто-выход после 5с полной тишины
     try:
         while True:
-            audio = chan.record(3.0)
-            rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
-            bars = '#' * min(40, int(rms * 400))
-            dec = rx_frame_bits(audio, 'FSK', pair)
+            rec = chan.record(3.0)
+            if len(rec) < 16:                 # пустое окно (loopback-старт) — ждём
+                continue
+            rms = float(np.sqrt(np.mean(rec ** 2)))
+            # энергия именно на тонах модема (видно сигнал, даже если не декодится)
+            tone = m.goertzel(rec, mark, FS) + m.goertzel(rec, space, FS)
+            audio = np.concatenate([tail, rec]) if len(tail) else rec
+            tail = rec[-int(TAIL_S * FS):].copy()
+
+            # корреляцию chirp'а гоняем только когда слышен тон — быстрее
+            dec = rx_frame_bits(audio, 'FSK', pair) if (rms > 0.002 or tone > 0) else None
             fr = decode_frame(dec) if dec else None
+
+            now = time.time()
+            if rms > 0.002:
+                last_sig = now
             if not fr:
-                print(f"\r[BLAST-RX] слушаю... {time.time()-t0:5.1f}с  "
-                      f"RMS {rms:.4f} {bars:<40} (нет сигнала — проверь микрофон, п.9)",
+                if now - last_sig > SILENCE_TIMEOUT and name is None:
+                    print(f"\n[BLAST-RX] {SILENCE_TIMEOUT:.0f}с тишины — выхожу "
+                          f"(сигнал не найден; проверь микрофон п.9)")
+                    return
+                tag = "слышу тон модема, ищу кадр" if rms > 0.005 else "тишина"
+                bars = '#' * min(40, int(rms * 400))
+                print(f"\r[BLAST-RX] {now-t0:5.1f}с RMS {rms:.4f} {bars:<28} {tag}   ",
                       end='', flush=True)
                 continue
+            last_sig = now
             if fr[0] == T_HANDSHAKE and name is None:
                 name, size, md5, n = fr[2].rstrip(b'\x00').decode().split('|')
                 size, n = int(size), int(n)
-                print(f"[BLAST-RX] файл '{name}': {size} Б, кадров {n}, MD5 {md5}")
+                print(f"\n[BLAST-RX] файл '{name}': {size} Б, кадров {n}, MD5 {md5}")
                 continue
             if fr[0] == T_DATA and name is not None:
                 ftype, seq, payload = fr
@@ -617,6 +646,8 @@ def cmd_listen(chan: Channel, pair: int):
                     buf.extend(payload[:max(0, take)])
                     expected += 1; got += 1
                     print(f"\n[BLAST-RX] кадр {got:3d}/{n}: {_preview(payload)}")
+                    if got >= n:      # всё приняли — не ждём EOF
+                        break
                 continue
             if fr[0] == T_EOF:
                 break
