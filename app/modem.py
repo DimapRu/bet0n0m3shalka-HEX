@@ -488,6 +488,85 @@ def pick_file_to_send() -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# ОДНОСТОРОННИЙ РЕЖИМ (без приёмника/ACK): TX просто кричит файл в эфир,
+# RX (или запись на телефон) собирает кадры. Всё в FSK — максимально надёжно.
+# ---------------------------------------------------------------------------
+BCAST_GAP_S = 0.15          # пауза между кадрами при вещании
+
+
+def cmd_blast(chan: Channel, path: str, pair: int):
+    with open(path, 'rb') as f:
+        data = f.read()
+    name = os.path.basename(path)[:12]
+    md5 = hashlib.md5(data).hexdigest()[:8]
+    frames = [data[i:i + PAYLOAD_BYTES] for i in range(0, len(data), PAYLOAD_BYTES)]
+    n = len(frames)
+    print(f"[BLAST-TX] '{name}': {len(data)} Б, MD5 {md5}, кадров {n}, FSK, БЕЗ ACK")
+    print("[BLAST-TX] через 3 с — включи пункт 8 на приёмнике или диктофон!")
+    time.sleep(3.0)
+    t0 = time.time()
+    # handshake дважды (вдруг приёмник включился посреди первого)
+    hs = encode_frame(T_HANDSHAKE, 0, f"{name}|{len(data)}|{md5}|{n}".encode())
+    chan.play(tx_frame_audio(hs, 'FSK', pair)); time.sleep(BCAST_GAP_S)
+    chan.play(tx_frame_audio(hs, 'FSK', pair)); time.sleep(BCAST_GAP_S)
+    for i, chunk in enumerate(frames):
+        bits = encode_frame(T_DATA, i % 256, chunk)
+        chan.play(tx_frame_audio(bits, 'FSK', pair))
+        time.sleep(BCAST_GAP_S)
+        if (i + 1) % 10 == 0 or i + 1 == n:
+            print(f"\r[BLAST-TX] {i+1}/{n}", end='', flush=True)
+    chan.play(tx_frame_audio(encode_frame(T_EOF, 0, b''), 'FSK', pair))
+    dt = time.time() - t0
+    print(f"\n[BLAST-TX] передал всё за {dt:.1f} с (~{len(data)*8/dt:.0f} бит/с)")
+
+
+def cmd_listen(chan: Channel, pair: int):
+    os.makedirs(RECV_DIR, exist_ok=True)
+    print("[BLAST-RX] слушаю одностороннюю передачу (FSK)... Ctrl+C — отмена")
+    name, size, md5, n = None, 0, '', 0
+    buf, expected, got = bytearray(), 0, 0
+    t0 = time.time()
+    try:
+        while True:
+            audio = chan.record(3.0)
+            dec = rx_frame_bits(audio, 'FSK', pair)
+            fr = decode_frame(dec) if dec else None
+            if not fr:
+                continue
+            if fr[0] == T_HANDSHAKE and name is None:
+                name, size, md5, n = fr[2].rstrip(b'\x00').decode().split('|')
+                size, n = int(size), int(n)
+                print(f"[BLAST-RX] файл '{name}': {size} Б, кадров {n}, MD5 {md5}")
+                continue
+            if fr[0] == T_DATA and name is not None:
+                ftype, seq, payload = fr
+                if seq == expected % 256:
+                    take = min(PAYLOAD_BYTES, size - len(buf))
+                    buf.extend(payload[:max(0, take)])
+                    expected += 1; got += 1
+                    print(f"\r[BLAST-RX] {got}/{n} кадров", end='', flush=True)
+                continue
+            if fr[0] == T_EOF:
+                break
+    except KeyboardInterrupt:
+        print("\n[BLAST-RX] остановлено пользователем")
+    print()
+    if name is None:
+        print("[BLAST-RX] ничего не услышал (нет handshake)")
+        return
+    data = bytes(buf[:size])
+    got_md5 = hashlib.md5(data).hexdigest()[:8]
+    ok = (got_md5 == md5 and got >= n)
+    out = os.path.join(RECV_DIR, name)
+    open(out, 'wb').write(data)
+    dt = time.time() - t0
+    print(f"[BLAST-RX] принято {got}/{n} кадров за {dt:.1f} с")
+    print(f"[BLAST-RX] MD5: {got_md5} vs {md5} -> "
+          f"{'OK' if ok else 'FAIL (потери — без ACK не восстановить)'}")
+    print(f"[BLAST-RX] сохранено -> {out}")
+
+
 def main():
     ap = argparse.ArgumentParser(description='Аудиомодем: передача файлов звуком')
     ap.add_argument('--pair', type=int, default=1, help='номер пары (развод частот, тест 5)')
@@ -514,6 +593,8 @@ def main():
         print("4) Замер фонового шума")
         print("5) Loopback-тест (без железа)")
         print("6) Проверка связи (есть ли приёмник рядом)")
+        print("7) Передать файл БЕЗ подтверждений (односторонний, FSK)")
+        print("8) Принять одностороннюю передачу (п.7)")
         print("0) Выход")
         c = input("> ").strip()
         if c == '1':
@@ -541,6 +622,10 @@ def main():
             t.start(); time.sleep(0.3)
             cmd_send(lb_tx, test, args.pair); t.join(timeout=120)
         elif c == '6': cmd_ping(chan, args.pair)
+        elif c == '7':
+            p = pick_file_to_send()
+            if p: cmd_blast(chan, p, args.pair)
+        elif c == '8': cmd_listen(chan, args.pair)
         elif c == '0': break
 
 
