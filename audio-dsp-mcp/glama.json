@@ -1,0 +1,30 @@
+{
+  "name": "audio-dsp-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for DSP and audio modems: signal generation, modulation (FSK/ASK/BPSK), analysis, equalization, FEC",
+  "author": "audio-dsp-mcp contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Dimap/audio-dsp-mcp"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "dsp",
+    "audio-modem",
+    "fsk",
+    "psk",
+    "ask",
+    "ofdm",
+    "signal-processing",
+    "reed-solomon",
+    "ber",
+    "acoustic-modem"
+  ],
+  "runtime": "python",
+  "runtime_version": "3.11+",
+  "entry_point": "audio_dsp_server.py",
+  "tools_count": 33,
+  "categories": ["dsp", "audio", "modem", "signal-processing"]
+}
